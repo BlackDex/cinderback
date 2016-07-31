@@ -437,7 +437,6 @@ class BackupService(object):
             except exceptions.OverLimit as exc:
                 _LE('Error while doing backup %s', exc)
                 failed.append(vol)
-                break
             except Exception:
                 _LX('Exception while doing backup')
                 failed.append(vol)
