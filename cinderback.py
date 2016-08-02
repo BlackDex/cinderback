@@ -420,8 +420,8 @@ class BackupService(object):
 
         _LI('Starting Volumes Backup')
         for vol in volumes:
-            if vol.id != "aee4d6fe-2181-4132-813b-453bf627a1f8":
-                continue
+            #if vol.id != "aee4d6fe-2181-4132-813b-453bf627a1f8":
+            #    continue
 
             _LI('Processing %dGB from volume %s (id: %s)', vol.size, vol.name,
                 vol.id)
@@ -467,6 +467,8 @@ class BackupService(object):
                     remove = len(existing_backups[vol.id]) - keep_only
                     # We may have to remove multiple backups and we remove the
                     # oldest ones, which are the first on the list.
+                    # We need to remove them in opposite order (newest first)
+                    # to unwind incremnetal backups
                     for i in xrange(remove-1,-1,-1):
                         back = existing_backups[vol.id][i]
                         _LI('Removing old backup %s from %s', back.id,
