@@ -178,6 +178,8 @@ def get_arg_parser():
                                default=None,  metavar='<FILENAME>',
                                help='export all auto backup metadata to file')
     parser_backup.add_argument('--forget-tenants', **forget_tenants)
+    parser_backup.add_argument('--incremental', dest='incremental', action='store_true',
+                          default=False, help="try to make incremental backup")
     parser_backup.add_argument('--timeout-gb', **timeout)
     parser_backup.add_argument('--keep-only', dest='keep_only', default=0,
                                metavar='<#>',
@@ -358,6 +360,12 @@ class BackupService(object):
         """Check whether backup service is up and running or not.
         If we are not allowed to check it we assume it's always up."""
         # Get services list
+
+
+        # 
+        return True
+
+
         try:
             services = self.client.services.list()
 
@@ -390,7 +398,7 @@ class BackupService(object):
 
         return {}
 
-    def backup_all(self, all_tenants=True, keep_tenant=True, keep_only=0):
+    def backup_all(self, all_tenants=True, keep_tenant=True, keep_only=0,incremental=False):
         """Creates backup for all visible volumes.
 
         :all_tenants: Backup volumes for all tenants, not only ourselves.
@@ -412,6 +420,9 @@ class BackupService(object):
 
         _LI('Starting Volumes Backup')
         for vol in volumes:
+            if vol.id != "aee4d6fe-2181-4132-813b-453bf627a1f8":
+                continue
+
             _LI('Processing %dGB from volume %s (id: %s)', vol.size, vol.name,
                 vol.id)
 
@@ -425,9 +436,12 @@ class BackupService(object):
             # Do the backup
             try:
                 backup = self.backup_volume(vol,
-                                            client=tenant_client)
+                                            client=tenant_client,
+                                            incremental=incremental)
             except BackupIsDown:
-                raise
+                _LE('Cinder Backup is down')
+                failed.append(vol)
+                backup = None
             except TimeoutError:
                 _LE('Timeout on backup')
                 failed.append(vol)
@@ -453,12 +467,13 @@ class BackupService(object):
                     remove = len(existing_backups[vol.id]) - keep_only
                     # We may have to remove multiple backups and we remove the
                     # oldest ones, which are the first on the list.
-                    for __ in xrange(remove):
-                        back = existing_backups[vol.id].pop(0)
+                    for i in xrange(remove-1,-1,-1):
+                        back = existing_backups[vol.id][i]
                         _LI('Removing old backup %s from %s', back.id,
                             back.created_at_dt)
                         self._delete_resource(back, need_up=True)
             _LI('Backup completed')
+            
 
         _LI('Finished with backups')
         return (backups, failed)
@@ -497,11 +512,13 @@ class BackupService(object):
         try:
             resource.delete()
             if wait:
-                self._wait_for(resource, ('deleting',), need_up=need_up)
+                self._wait_for(resource, ('deleting','available'), 'deleted', need_up=need_up)
 
         # If it doesn't exist we consider it "deleted"
-        #except exceptions.NotFound:
-        except:
+        except exceptions.NotFound:
+            pass
+        except Exception as e:
+            _LW('Backup delete failed: %s', e)  
             pass
 
     def _create_and_wait(self, msg, module, arguments, resources=tuple()):
@@ -530,7 +547,7 @@ class BackupService(object):
 
         return result
 
-    def backup_volume(self, volume, name=None, client=None):
+    def backup_volume(self, volume, name=None, client=None,incremental=False):
         """Backup a volume using a volume object or it's id.
 
         :param volume: Volume object or volume id as a string.
@@ -547,20 +564,29 @@ class BackupService(object):
         # Use given client or instance's client
         #client = client or self.client
         name = name or self.name_prefix + volume.name + "_" + datetime.now().strftime('%Y-%m-%d-%H:%M:%S')
+        if incremental:
+            name = name + "_incremental"
 
         # Use encoded original volume info as description
         description = BackupInfo(volume)
 
         if volume.status == 'in-use' or volume.status == 'available':
-            #try:
-            #    backup = self._create_and_wait(
-            #        'Creating incremental backup', client.backups,
-            #        arguments=dict(
-            #            volume_id=volume.id, name=name, container=None, force=True, incremental=True,
-            #            description=str(description)))
-            #except exceptions.BadRequest:
-            #    _LI('Incremental backup failed')
-            backup = self._create_and_wait(
+            if incremental:
+                try:
+                    backup = self._create_and_wait(
+                        'Creating incremental backup', client.backups,
+                        arguments=dict(
+                            volume_id=volume.id, name=name, container=None, force=True, incremental=True,
+                            description=str(description)))
+                except exceptions.BadRequest:
+                    _LI('Incremental backup failed')
+                    backup = self._create_and_wait(
+                            'Creating regular backup', client.backups,
+                            arguments=dict(
+                                volume_id=volume.id, name=name, container=None, force=True,
+                                description=str(description)))
+            else:
+                backup = self._create_and_wait(
                     'Creating regular backup', client.backups,
                     arguments=dict(
                         volume_id=volume.id, name=name, container=None, force=True,
@@ -830,7 +856,8 @@ def main(args):
         try:
             __, failed = backup.backup_all(all_tenants=args.all_tenants,
                                            keep_tenant=args.keep_tenants,
-                                           keep_only=args.keep_only)
+                                           keep_only=args.keep_only,
+                                           incremental=args.incremental)
         except BackupIsDown:
             _LC('Cinder Backup is ' + backup.backup_status)
 
