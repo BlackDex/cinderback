@@ -566,19 +566,20 @@ class BackupService(object):
         # Use given client or instance's client
         #client = client or self.client
         name = name or self.name_prefix + volume.name + "_" + datetime.now().strftime('%Y-%m-%d-%H:%M:%S')
-        if incremental:
-            name = name + "_incremental"
 
         # Use encoded original volume info as description
         description = BackupInfo(volume)
 
-        if volume.status == 'in-use' or volume.status == 'available':
+        if 'no_backup' in volume.description :
+            _LI("Skipping backup")
+            raise UnexpectedStatus(what=volume)
+        elif volume.status == 'in-use' or volume.status == 'available':
             if incremental:
                 try:
                     backup = self._create_and_wait(
                         'Creating incremental backup', client.backups,
                         arguments=dict(
-                            volume_id=volume.id, name=name, container=None, force=True, incremental=True,
+                            volume_id=volume.id, name=name + "_incremental", container=None, force=True, incremental=True,
                             description=str(description)))
                 except exceptions.BadRequest:
                     _LI('Incremental backup failed')
