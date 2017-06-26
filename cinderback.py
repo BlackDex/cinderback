@@ -28,6 +28,7 @@ import sys
 import time
 
 from cinderclient import client
+from cinderclient import exceptions
 from cinderclient import v2
 from cinderclient import __version__ as cinder_version
 
@@ -177,6 +178,8 @@ def get_arg_parser():
                                default=None,  metavar='<FILENAME>',
                                help='export all auto backup metadata to file')
     parser_backup.add_argument('--forget-tenants', **forget_tenants)
+    parser_backup.add_argument('--incremental', dest='incremental', action='store_true',
+                          default=False, help="try to make incremental backup")
     parser_backup.add_argument('--timeout-gb', **timeout)
     parser_backup.add_argument('--keep-only', dest='keep_only', default=0,
                                metavar='<#>',
@@ -357,11 +360,17 @@ class BackupService(object):
         """Check whether backup service is up and running or not.
         If we are not allowed to check it we assume it's always up."""
         # Get services list
+
+
+        # 
+        return True
+
+
         try:
             services = self.client.services.list()
 
         # If policy doesn't allow us to check we'll have to assume it's there
-        except client.exceptions.Forbidden:
+        except exceptions.Forbidden:
             return True
 
         # Search for cinder backup service
@@ -389,7 +398,7 @@ class BackupService(object):
 
         return {}
 
-    def backup_all(self, all_tenants=True, keep_tenant=True, keep_only=0):
+    def backup_all(self, all_tenants=True, keep_tenant=True, keep_only=0,incremental=False):
         """Creates backup for all visible volumes.
 
         :all_tenants: Backup volumes for all tenants, not only ourselves.
@@ -411,9 +420,12 @@ class BackupService(object):
 
         _LI('Starting Volumes Backup')
         for vol in volumes:
+            #if vol.id != "aee4d6fe-2181-4132-813b-453bf627a1f8":
+            #    continue
+
             _LI('Processing %dGB from volume %s (id: %s)', vol.size, vol.name,
                 vol.id)
-            backup_name = self.name_prefix + vol.id
+
 
             # See owner tenant and check if it's us
             owner_tenant_id = getattr(vol, 'os-vol-tenant-attr:tenant_id')
@@ -423,20 +435,22 @@ class BackupService(object):
 
             # Do the backup
             try:
-                backup = self.backup_volume(vol, name=backup_name,
-                                            client=tenant_client)
+                backup = self.backup_volume(vol,
+                                            client=tenant_client,
+                                            incremental=incremental)
             except BackupIsDown:
-                raise
+                _LE('Cinder Backup is down')
+                failed.append(vol)
+                backup = None
             except TimeoutError:
                 _LE('Timeout on backup')
                 failed.append(vol)
                 backup = None
             except UnexpectedStatus:
                 failed.append(vol)
-            except client.exceptions.OverLimit as exc:
+            except exceptions.OverLimit as exc:
                 _LE('Error while doing backup %s', exc)
                 failed.append(vol)
-                break
             except Exception:
                 _LX('Exception while doing backup')
                 failed.append(vol)
@@ -453,12 +467,16 @@ class BackupService(object):
                     remove = len(existing_backups[vol.id]) - keep_only
                     # We may have to remove multiple backups and we remove the
                     # oldest ones, which are the first on the list.
-                    for __ in xrange(remove):
-                        back = existing_backups[vol.id].pop(0)
+                    # We need to remove them in opposite order (newest first)
+                    # to unwind incremnetal backups
+                    for i in xrange(remove-1,-1,-1):
+                        back = existing_backups[vol.id][i]
                         _LI('Removing old backup %s from %s', back.id,
                             back.created_at_dt)
                         self._delete_resource(back, need_up=True)
             _LI('Backup completed')
+            
+
         _LI('Finished with backups')
         return (backups, failed)
 
@@ -497,10 +515,13 @@ class BackupService(object):
         try:
             resource.delete()
             if wait:
-                self._wait_for(resource, ('deleting',), need_up=need_up)
+                self._wait_for(resource, ('deleting','available'), 'deleted', need_up=need_up)
 
         # If it doesn't exist we consider it "deleted"
-        except client.exceptions.NotFound:
+        except exceptions.NotFound:
+            pass
+        except Exception as e:
+            _LW('Backup delete failed: %s', e)  
             pass
         except Exception as exc:
             if raise_on_exc:
@@ -534,7 +555,7 @@ class BackupService(object):
 
         return result
 
-    def backup_volume(self, volume, name=None, client=None):
+    def backup_volume(self, volume, name=None, client=None,incremental=False):
         """Backup a volume using a volume object or it's id.
 
         :param volume: Volume object or volume id as a string.
@@ -549,51 +570,36 @@ class BackupService(object):
             volume = self.client.volumes.get(volume)
 
         # Use given client or instance's client
-        client = client or self.client
-        name = name or self.name_prefix + volume.id
+        #client = client or self.client
+        name = name or self.name_prefix + volume.name + "_" + datetime.now().strftime('%Y-%m-%d-%H:%M:%S')
 
         # Use encoded original volume info as description
         description = BackupInfo(volume)
 
-        if volume.status == 'in-use':
-            _LI('Volume online so this is a multi-step process')
-
-            # Force snapshot since volume it's in-use
-            snapshot = self._create_and_wait(
-                'Creating snapshot', client.volume_snapshots,
-                arguments=dict(
-                    volume_id=volume.id, force=True, name='tmp ' + name,
-                    description='Temporary snapshot for backup',
-                    metadata=volume.metadata))
-
-            # Create temporary volume from snapshot
-            tmp_vol = self._create_and_wait(
-                'Creating temp volume from snapshot', client.volumes,
-                arguments=dict(
-                    size=snapshot.size, snapshot_id=snapshot.id,
-                    name='tmp '+name,
-                    description='Temporary volume for backup',
-                    metadata=volume.metadata), resources=(snapshot,))
-
-            # Backup temporary volume
-            backup = self._create_and_wait(
-                'Doing the actual backup', client.backups,
-                arguments=dict(
-                    volume_id=tmp_vol.id, name=name, container=None,
-                    description=str(description)),
-                resources=(snapshot, tmp_vol))
-
-            # Cleanup temporary resources
-            _LI('Deleting temporary volume and snapshot')
-            tmp_vol.delete()
-            snapshot.delete()
-
-        elif volume.status == 'available':
-            backup = self._create_and_wait(
-                'Creating direct backup', client.backups,
-                arguments=dict(
-                    volume_id=volume.id, name=name, container=None,
-                    description=str(description)))
+        if 'no_backup' in volume.description :
+            _LI("Skipping backup")
+            raise UnexpectedStatus(what=volume)
+        elif volume.status == 'in-use' or volume.status == 'available':
+            if incremental:
+                try:
+                    backup = self._create_and_wait(
+                        'Creating incremental backup', client.backups,
+                        arguments=dict(
+                            volume_id=volume.id, name=name + "_incremental", container=None, force=True, incremental=True,
+                            description=str(description)))
+                except exceptions.BadRequest:
+                    _LI('Incremental backup failed')
+                    backup = self._create_and_wait(
+                            'Creating regular backup', client.backups,
+                            arguments=dict(
+                                volume_id=volume.id, name=name, container=None, force=True,
+                                description=str(description)))
+            else:
+                backup = self._create_and_wait(
+                    'Creating regular backup', client.backups,
+                    arguments=dict(
+                        volume_id=volume.id, name=name, container=None, force=True,
+                        description=str(description)))
 
         else:
             _LE("We don't backup volume because status is %s", volume.status)
@@ -628,7 +634,7 @@ class BackupService(object):
         for backup in backups:
             backup.created_at_dt = datetime.strptime(backup.created_at,
                                                      '%Y-%m-%dT%H:%M:%S.%f')
-            volumes[backup.name[len(self.name_prefix):]].append(backup)
+            volumes[backup.volume_id].append(backup)
 
         # Order the backups for each volume oldest first
         for volume in volumes.itervalues():
@@ -641,7 +647,6 @@ class BackupService(object):
         restore = client.restores.restore(backup_id=backup_id,
                                           volume_id=new_volume_id)
 
-        volume = client.volumes.get(restore.volume_id)
         result = self._wait_for(volume, ('restoring-backup',), 'available',
                                 True)
         return result
@@ -665,10 +670,10 @@ class BackupService(object):
                 if volume.status != 'available':
                     _LW('Skipping, cannot restore to a non-available volume')
                     return
-            except client.exceptions.NotFound:
+            except exceptions.NotFound:
                 _LW("Skipping, destination id doesn't exist")
                 return
-            except client.exceptions.ClientException as e:
+            except exceptions.ClientException as e:
                 _LW('Error when checking volume (%s)', e)
                 return
             new_id = backup_info.id
@@ -861,7 +866,8 @@ def main(args):
         try:
             __, failed = backup.backup_all(all_tenants=args.all_tenants,
                                            keep_tenant=args.keep_tenants,
-                                           keep_only=args.keep_only)
+                                           keep_only=args.keep_only,
+                                           incremental=args.incremental)
         except BackupIsDown:
             _LC('Cinder Backup is ' + backup.backup_status)
 
