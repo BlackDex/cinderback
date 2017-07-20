@@ -784,10 +784,12 @@ class BackupService(object):
     def get_client(self, tenant_id, keep_tenant=True):
         """Return a client for requested tenant"""
         # If we are the original tenant of the volume
-        if (not keep_tenant or
-                self.client.client.auth_ref['token']['tenant']['id']
-                == tenant_id):
-            return self.client
+        ## BlackDex: Comment-out this part since it generates an error:
+        ## TypeError: 'AccessInfoV2' object has no attribute '__getitem__'
+        #if (not keep_tenant or
+        #        self.client.client.auth_ref['token']['tenant']['id']
+        #        == tenant_id):
+        #    return self.client
 
         _LI("Using tenant id %s", tenant_id)
         return client.Client(version=2,
